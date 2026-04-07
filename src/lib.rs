@@ -5,6 +5,7 @@ use uuid::Uuid;
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Document {
@@ -161,7 +162,7 @@ impl Database {
                     Ok(format!("Documento inserido com ID: {}", id))
                 }
             }
-            parser::Query::Select { fields, collection, join, filter, order_by, limit } => {
+            parser::Query::Select { fields, collection, join, filter, group_by, order_by, limit } => {
                 let coll = self.get_collection(&collection.name)?;
                 let base_docs = if let Some(ref f) = filter {
                     coll.find(|d| matches_filter(self, d, f).unwrap_or(false))?
@@ -169,15 +170,13 @@ impl Database {
                     coll.find_all()?
                 };
 
-                let mut final_results = Vec::new();
+                let left_alias = collection.alias.clone().unwrap_or(collection.name.clone());
+                let mut joined_raw = Vec::new();
 
                 if let Some(join_info) = join {
                     let right_coll = self.get_collection(&join_info.collection.name)?;
                     let right_docs = right_coll.find_all()?;
                     
-                    let mut joined_raw = Vec::new();
-
-                    let left_alias = collection.alias.clone().unwrap_or(collection.name.clone());
                     let right_alias = join_info.collection.alias.clone().unwrap_or(join_info.collection.name.clone());
 
                     let left_field = strip_table_prefix(&join_info.left_field, &collection.name, collection.alias.as_deref());
@@ -222,15 +221,50 @@ impl Database {
                             }
                         }
                     }
-                    
-                    for raw in joined_raw {
-                        final_results.push(project_fields_flat(&fields, raw, &left_alias, &right_alias));
-                    }
                 } else {
-                    let alias = collection.alias.unwrap_or(collection.name);
                     for doc in base_docs {
-                        final_results.push(project_fields_flat(&fields, doc.to_json_flat(), &alias, ""));
+                        joined_raw.push(doc.to_json_flat());
                     }
+                }
+
+                // Determinar se e consulta agrupada
+                let has_aggr = match &fields {
+                    parser::SelectFields::All => false,
+                    parser::SelectFields::Specific(fs) => fs.iter().any(|f| f.function.is_some()),
+                };
+
+                let mut buckets: Vec<Vec<Value>> = Vec::new();
+
+                if let Some(gb_fields) = group_by {
+                    // Hashmap baseado nas strings serializadas dos valores dos campos
+                    let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
+                    for row in joined_raw {
+                        if let Some(obj) = row.as_object() {
+                            let mut key_parts = Vec::new();
+                            for g_field in &gb_fields {
+                                let val = resolve_scoped_field(g_field, obj, &left_alias, "");
+                                key_parts.push(val.to_string());
+                            }
+                            let key = key_parts.join("||");
+                            groups.entry(key).or_insert_with(Vec::new).push(row);
+                        }
+                    }
+                    for (_, bucket) in groups {
+                        buckets.push(bucket);
+                    }
+                } else if has_aggr {
+                    // Sem group by, mas com MAX/COUNT -> trata tudo como um grande bucket unico
+                    buckets.push(joined_raw);
+                } else {
+                    // Sem Agrupamento, cada row e um bucket de tamanho 1
+                    for row in joined_raw {
+                        buckets.push(vec![row]);
+                    }
+                }
+
+                let mut final_results = Vec::new();
+                for bucket in buckets {
+                    final_results.push(project_fields_aggr(&fields, &bucket, &left_alias, ""));
                 }
 
                 // ORDER BY
@@ -455,7 +489,6 @@ fn compare_values_ord(a: &Value, b: &Value) -> std::cmp::Ordering {
     } else if let (Some(as_str), Some(bs_str)) = (a.as_str(), b.as_str()) {
         as_str.cmp(bs_str)
     } else {
-        // Fallback para tipos mistos ou nulos
         a.to_string().cmp(&b.to_string())
     }
 }
@@ -483,32 +516,81 @@ fn merge_docs_flat(left_info: &parser::TableInfo, left: &Document, right_info: &
     Value::Object(merged)
 }
 
-fn project_fields_flat(fields: &parser::SelectFields, data: Value, left_alias: &str, right_alias: &str) -> Value {
+fn resolve_scoped_field<'a>(field_name: &str, obj: &'a Map<String, Value>, left_alias: &str, right_alias: &str) -> &'a Value {
+    if let Some(val) = obj.get(field_name) {
+        return val;
+    }
+    let clean_field = if let Some(pos) = field_name.find('.') {
+        let prefix = &field_name[..pos];
+        if prefix == left_alias || prefix == right_alias {
+            &field_name[pos+1..]
+        } else {
+            field_name
+        }
+    } else {
+        field_name
+    };
+    obj.get(clean_field).unwrap_or(&Value::Null)
+}
+
+fn project_fields_aggr(fields: &parser::SelectFields, bucket: &Vec<Value>, left_alias: &str, right_alias: &str) -> Value {
     match fields {
-        parser::SelectFields::All => data,
+        parser::SelectFields::All => {
+            // Em SELECT * SEM GROUP BY, bucket tem tam 1
+            if bucket.is_empty() { return Value::Null; }
+            bucket[0].clone()
+        },
         parser::SelectFields::Specific(fields) => {
             let mut projected = Map::new();
-            if let Some(obj) = data.as_object() {
-                for f in fields {
-                    let out_name = f.alias.as_ref().unwrap_or(&f.name);
-                    
-                    if let Some(val) = obj.get(&f.name) {
-                        projected.insert(out_name.clone(), val.clone());
-                    } else {
-                        let clean_field = if let Some(pos) = f.name.find('.') {
-                            let prefix = &f.name[..pos];
-                            if prefix == left_alias || prefix == right_alias {
-                                &f.name[pos+1..]
+            if bucket.is_empty() { return Value::Object(projected); }
+
+            for f in fields {
+                let out_name = f.alias.as_ref().unwrap_or(&f.name);
+                
+                if let Some(aggr) = f.function {
+                    let mut vals = Vec::new();
+                    for row in bucket {
+                        if let Some(obj) = row.as_object() {
+                            if f.name == "*" {
+                                vals.push(Value::Null); // Apenas preenche
                             } else {
-                                &f.name
+                                let v = resolve_scoped_field(&f.name, obj, left_alias, right_alias);
+                                if !v.is_null() { vals.push(v.clone()); }
                             }
-                        } else {
-                            &f.name
-                        };
-                        
-                        if let Some(val) = obj.get(clean_field) {
-                            projected.insert(out_name.clone(), val.clone());
                         }
+                    }
+
+                    match aggr {
+                        parser::AggrFunc::Count => {
+                            projected.insert(out_name.clone(), json!(vals.len()));
+                        }
+                        parser::AggrFunc::Sum => {
+                            let mut sum = 0.0;
+                            for v in vals { if let Some(nf) = v.as_f64() { sum += nf; } }
+                            projected.insert(out_name.clone(), json!(sum));
+                        }
+                        parser::AggrFunc::Avg => {
+                            let mut sum = 0.0;
+                            let mut c = 0.0;
+                            for v in &vals { if let Some(nf) = v.as_f64() { sum += nf; c += 1.0; } }
+                            let avg = if c > 0.0 { sum / c } else { 0.0 };
+                            projected.insert(out_name.clone(), json!(avg));
+                        }
+                        parser::AggrFunc::Min => {
+                            let min = vals.into_iter().min_by(compare_values_ord).unwrap_or(Value::Null);
+                            projected.insert(out_name.clone(), min);
+                        }
+                        parser::AggrFunc::Max => {
+                            let max = vals.into_iter().max_by(compare_values_ord).unwrap_or(Value::Null);
+                            projected.insert(out_name.clone(), max);
+                        }
+                    }
+
+                } else {
+                    // Sem função agregada, assume valor da primeira row do bucket (padrão MYSQL p/ GROUP BY)
+                    if let Some(obj) = bucket[0].as_object() {
+                        let v = resolve_scoped_field(&f.name, obj, left_alias, right_alias);
+                        projected.insert(out_name.clone(), v.clone());
                     }
                 }
             }

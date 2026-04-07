@@ -19,6 +19,7 @@ pub enum Query {
         collection: TableInfo, 
         join: Option<JoinInfo>,
         filter: Option<Filter>,
+        group_by: Option<Vec<String>>,
         order_by: Option<(String, SortDir)>,
         limit: Option<usize>,
     },
@@ -28,10 +29,20 @@ pub enum Query {
     ShowCollections,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum AggrFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct SelectField {
-    pub name: String,
+    pub name: String, // is "*" if Count(*)
     pub alias: Option<String>,
+    pub function: Option<AggrFunc>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -96,7 +107,7 @@ fn is_reserved_keyword(s: &str) -> bool {
         "SELECT" | "FROM" | "WHERE" | "JOIN" | "ON" | "AS" | "IN" | "AND" | "OR" | 
         "INNER" | "LEFT" | "RIGHT" | "INSERT" | "UPDATE" | "DELETE" | "SET" | 
         "DROP" | "SHOW" | "COLLECTIONS" | "COLLECTION" | "ORDER" | "BY" | "LIMIT" |
-        "ASC" | "DESC"
+        "ASC" | "DESC" | "GROUP" | "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
     )
 }
 
@@ -152,6 +163,7 @@ pub fn parse_query(input: &str) -> Res<'_, Query> {
             (input, None)
         };
 
+        let (input, group_by) = opt(parse_group_by).parse(input)?;
         let (input, order_by) = opt(parse_order_by).parse(input)?;
         let (input, limit) = opt(parse_limit).parse(input)?;
 
@@ -160,6 +172,7 @@ pub fn parse_query(input: &str) -> Res<'_, Query> {
             collection: coll, 
             join, 
             filter,
+            group_by,
             order_by,
             limit,
         }));
@@ -211,6 +224,37 @@ pub fn parse_query(input: &str) -> Res<'_, Query> {
 }
 
 fn parse_select_field(input: &str) -> Res<'_, SelectField> {
+    // Tenta primeiro parsear uma funcao agregada: FUNC(field)
+    if let Ok((input_func, func)) = alt((
+        tag_no_case::<&str, &str, Error<&str>>("COUNT").map(|_| AggrFunc::Count),
+        tag_no_case::<&str, &str, Error<&str>>("SUM").map(|_| AggrFunc::Sum),
+        tag_no_case::<&str, &str, Error<&str>>("AVG").map(|_| AggrFunc::Avg),
+        tag_no_case::<&str, &str, Error<&str>>("MIN").map(|_| AggrFunc::Min),
+        tag_no_case::<&str, &str, Error<&str>>("MAX").map(|_| AggrFunc::Max),
+    )).parse(input) {
+        let (input_func, _) = multispace0::<&str, Error<&str>>.parse(input_func)?;
+        let (input_func, _) = char('(').parse(input_func)?;
+        let (input_func, _) = multispace0::<&str, Error<&str>>.parse(input_func)?;
+        
+        let (input_func, name) = alt((
+            tag::<&str, &str, Error<&str>>("*").map(|_| "*".to_string()),
+            identifier
+        )).parse(input_func)?;
+
+        let (input_func, _) = multispace0::<&str, Error<&str>>.parse(input_func)?;
+        let (input_func, _) = char(')').parse(input_func)?;
+        
+        let (input_func, alias) = opt(tuple((
+            multispace1::<&str, Error<&str>>,
+            opt(tag_no_case::<&str, &str, Error<&str>>("AS")),
+            multispace0::<&str, Error<&str>>,
+            alias_identifier
+        ))).map(|opt| opt.map(|(_, _, _, id)| id)).parse(input_func)?;
+
+        return Ok((input_func, SelectField { name, alias, function: Some(func) }));
+    }
+
+    // Se nao for funcao, parseia campo normal
     let (input, name) = identifier(input)?;
     let (input, alias) = opt(tuple((
         multispace1::<&str, Error<&str>>,
@@ -218,7 +262,7 @@ fn parse_select_field(input: &str) -> Res<'_, SelectField> {
         multispace0::<&str, Error<&str>>,
         alias_identifier
     ))).map(|opt| opt.map(|(_, _, _, id)| id)).parse(input)?;
-    Ok((input, SelectField { name, alias }))
+    Ok((input, SelectField { name, alias, function: None }))
 }
 
 fn parse_table_info(input: &str) -> Res<'_, TableInfo> {
@@ -281,6 +325,21 @@ fn parse_and_expr(input: &str) -> Res<'_, Filter> {
     } else {
         Ok((input, Filter::And(filters)))
     }
+}
+
+fn parse_group_by(input: &str) -> Res<'_, Vec<String>> {
+    let (input, _) = (
+        multispace1::<&str, Error<&str>>, 
+        tag_no_case::<&str, &str, Error<&str>>("GROUP"), 
+        multispace1::<&str, Error<&str>>, 
+        tag_no_case::<&str, &str, Error<&str>>("BY"), 
+        multispace1::<&str, Error<&str>>
+    ).parse(input)?;
+    
+    separated_list1(
+        (multispace0::<&str, Error<&str>>, char::<&str, Error<&str>>(','), multispace0::<&str, Error<&str>>),
+        identifier
+    ).parse(input)
 }
 
 fn parse_order_by(input: &str) -> Res<'_, (String, SortDir)> {
@@ -368,6 +427,9 @@ fn capture_value_blob(input: &str) -> Res<'_, &str> {
     let mut end_pos = input.len();
     if let Some(pos) = lower.find(" and ") { end_pos = end_pos.min(pos); }
     if let Some(pos) = lower.find(" or ") { end_pos = end_pos.min(pos); }
+    if let Some(pos) = lower.find(" group ") { end_pos = end_pos.min(pos); }
+    if let Some(pos) = lower.find(" order ") { end_pos = end_pos.min(pos); }
+    if let Some(pos) = lower.find(" limit ") { end_pos = end_pos.min(pos); }
     if let Some(pos) = lower.find(")") { end_pos = end_pos.min(pos); }
     if let Some(pos) = lower.find(";") { end_pos = end_pos.min(pos); }
     if let Some(pos) = lower.find("\n") { end_pos = end_pos.min(pos); }
@@ -429,6 +491,23 @@ mod tests {
         if let Query::Select { order_by, limit, .. } = query {
             assert_eq!(order_by, Some(("age".to_string(), SortDir::Desc)));
             assert_eq!(limit, Some(10));
+        } else { panic!("Wrong query variant"); }
+    }
+
+    #[test]
+    fn test_parse_group_by_with_aggr() {
+        let q = "SELECT role_name, COUNT(id) AS qtd, SUM(age) AS sum_age FROM users GROUP BY role_name";
+        let (_, query) = parse_query(q).unwrap();
+        if let Query::Select { fields, group_by, .. } = query {
+            if let SelectFields::Specific(f) = fields {
+                assert_eq!(f[0].name, "role_name");
+                assert_eq!(f[1].name, "id");
+                assert_eq!(f[1].alias, Some("qtd".to_string()));
+                assert_eq!(f[1].function, Some(AggrFunc::Count));
+                assert_eq!(f[2].name, "age");
+                assert_eq!(f[2].function, Some(AggrFunc::Sum));
+            } else { panic!("Expected specific fields"); }
+            assert_eq!(group_by, Some(vec!["role_name".to_string()]));
         } else { panic!("Wrong query variant"); }
     }
 }
